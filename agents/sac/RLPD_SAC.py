@@ -15,8 +15,8 @@ from common.replaybuffer import ReplayBuffer
 from common.logger import MLFlowLogger
 from common.utils import load_demo_trajectories, load_demo_trajectories_parallel
 
-from networks.critic_own import Q_network, CombinedCritics
-from networks.actor_own import DeterministicPolicy, TanhGaussianPolicy
+from networks.critic import Q_network, CombinedCritics
+from networks.actor import DeterministicPolicy, TanhGaussianPolicy
 from flax.training.train_state import TrainState
 
 Transition = namedtuple('Transition', ['state', 'action', 'reward', 'termination', 'truncation', 'next_state'])
@@ -342,12 +342,10 @@ class SACPDAgent:
             rng, r_critic = jax.random.split(rng)
             
             # Extract micro-batches for this step
-            # Slicing is practically free here because we reshaped
             slice_on = jax.tree_util.tree_map(lambda x: x[i], online_sharded)
             slice_off = jax.tree_util.tree_map(lambda x: x[i], demo_sharded)
             
             # FUSE ON GPU: Concatenate online and offline data
-            # This replaces 'interleave_dicts'
             step_batch = jax.tree_util.tree_map(
                 lambda a, b: jnp.concatenate([a, b], axis=0), 
                 slice_on, slice_off
