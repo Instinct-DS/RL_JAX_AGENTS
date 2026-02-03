@@ -150,43 +150,43 @@ def _process_single_trajectory(tr_key: str, tr_data: Dict, demo_env, nds,
     thread_env.__dict__.update(demo_env.__dict__)  # Copy state
     
     result = tr_data["solution_vector"]
-    x_int, z_int, u_int, w_int, omg_int, lmbi_int, tht0_int, thtP_int = getInterpolators(result, nds)
+    # x_int, z_int, u_int, w_int, omg_int, lmbi_int, tht0_int, thtP_int = getInterpolators(result, nds)
     tf = result[-1]
     
-    # success = False
+    success = False
     num_phases = 10
     offsets = np.linspace(0.0, demo_env.dt, num_phases, endpoint=False)
     experiences = []
     
-    # # Try different epsilon values
-    # for eps in np.linspace(0, 1, 21):
-    #     x_int, z_int, u_int, w_int, omg_int, lmbi_int, tht0_int, thtP_int = getInterpolators(result, nds)
-    #     init = (x_int(-1), z_int(-1)+eps, u_int(-1), w_int(-1), omg_int(-1), 
-    #             tht0_int(-1), thtP_int(-1), lmbi_int(-1))
-    #     action_int = (tht0_int, thtP_int)
+    # Try different epsilon values for smooth landing
+    for eps in np.linspace(0, 0.3, 13):
+        x_int, z_int, u_int, w_int, omg_int, lmbi_int, tht0_int, thtP_int = getInterpolators(result, nds)
+        init = (x_int(-1), z_int(-1)+eps, u_int(-1), w_int(-1), omg_int(-1), 
+                tht0_int(-1), thtP_int(-1), lmbi_int(-1))
+        action_int = (tht0_int, thtP_int)
         
-    #     try:
-    #         sim_traj = thread_env._similate_trajectory(init, action_int, tf)
+        try:
+            sim_traj = thread_env._similate_trajectory(init, action_int, tf=tf)
             
-    #         if sim_traj[-1][3] and sim_traj[-1][-1]["constraints"][0][2]:
-    #             success = True
-    #             # Collect all experiences
-    #             for i in range(len(sim_traj)):
-    #                 experience = sim_traj[i]
-    #                 state, action, reward, termination, truncation, next_state, info = experience
-    #                 experiences.append((state, action, reward, termination, truncation, next_state))
-    #             break
-    #     except Exception as e:
-    #         warnings.warn(f"Error processing trajectory {tr_key}: {e}")
-    #         continue
+            if sim_traj[-1][3] and sim_traj[-1][-1]["constraints"][0][2]:
+                success = True
+                eps_f = eps
+                break
+        except Exception as e:
+            warnings.warn(f"Error processing trajectory {tr_key}: {e}")
+            continue
     
-    success = True
+    if success == False:
+        eps_f = 0
+    
     x_int, z_int, u_int, w_int, omg_int, lmbi_int, tht0_int, thtP_int = getInterpolators(result, nds)
-    init = (x_int(-1), z_int(-1), u_int(-1), w_int(-1), omg_int(-1), tht0_int(-1), thtP_int(-1), lmbi_int(-1))
+    init = [x_int(-1), z_int(-1), u_int(-1), w_int(-1), omg_int(-1), tht0_int(-1), thtP_int(-1), lmbi_int(-1)]
     action_int = (tht0_int, thtP_int)
     
     for offset in offsets:
         try:
+            t_initial_offset = (2/tf)*(offset) - 1 
+            init = [x_int(t_initial_offset), z_int(t_initial_offset)+eps_f, u_int(t_initial_offset), w_int(t_initial_offset), omg_int(t_initial_offset), tht0_int(t_initial_offset), thtP_int(t_initial_offset), lmbi_int(t_initial_offset)]
             sim_traj = thread_env._similate_trajectory(init, action_int, offset, tf)
             # Collect all experiences
             for i in range(len(sim_traj)):
@@ -238,12 +238,12 @@ def load_demo_trajectories_parallel(replay_buffer, demo_file, demo_env, nds, nds
     count_land, count_crash = 0, 0
     
     for success, experiences, tr_key in tqdm(results, desc="Adding to buffers"):
+        # Add experiences to replay buffers (sequential part)
+        for state, action, reward, termination, truncation, next_state in experiences:
+            for buffer_i in replay_buffer:
+                buffer_i.add(state, action, reward, termination, truncation, next_state)
         if success:
             count_land += 1       
-            # Add experiences to replay buffers (sequential part)
-            for state, action, reward, termination, truncation, next_state in experiences:
-                for buffer_i in replay_buffer:
-                    buffer_i.add(state, action, reward, termination, truncation, next_state)
         else:
             count_crash += 1
     
