@@ -22,54 +22,12 @@ from flax.training.train_state import TrainState
 Transition = namedtuple('Transition', ['state', 'action', 'reward', 'termination', 'truncation', 'next_state'])
 
 class AlphaModule(nn.Module):
-    target_entropy: float
+    ent_init: float
     
     @nn.compact
     def __call__(self):
-        log_alpha = self.param('log_alpha', lambda key: jnp.zeros((1,)))
+        log_alpha = self.param('log_alpha', init_fn=lambda key: jnp.full((), jnp.log(self.ent_init)))
         return log_alpha
-    
-def interleave_dicts(a: dict, b: dict, ratio_a: int, ratio_b: int) -> dict:
-    """
-    Interleave arrays in dicts along axis 0 using an arbitrary ratio (ratio_a : ratio_b),
-    fully vectorized with NumPy (no inner Python loops).
-
-    Example:
-        ratio_a=3, ratio_b=1  -> A A A B
-        ratio_a=5, ratio_b=1  -> A A A A A B
-        ratio_a=7, ratio_b=2  -> A A A A A A A B B
-    """
-    combined = {}
-
-    for k, va in a.items():
-        vb = b[k]
-
-        if isinstance(va, dict):
-            combined[k] = interleave_dicts(va, vb, ratio_a, ratio_b)
-            continue
-
-        len_a, len_b = va.shape[0], vb.shape[0]
-
-        # Number of full blocks we can form
-        blocks = min(len_a // ratio_a, len_b // ratio_b)
-
-        # Main block-aligned portions
-        va_main = va[: blocks * ratio_a]
-        vb_main = vb[: blocks * ratio_b]
-
-        # Reshape into blocks
-        va_blocks = va_main.reshape(blocks, ratio_a, *va.shape[1:])
-        vb_blocks = vb_main.reshape(blocks, ratio_b, *vb.shape[1:])
-
-        # Concatenate A and B inside each block
-        interleaved = np.concatenate([va_blocks, vb_blocks], axis=1)
-        interleaved = interleaved.reshape(
-            blocks * (ratio_a + ratio_b), *va.shape[1:]
-        )
-
-        combined[k] = interleaved
-
-    return combined
 
 # Define the functions required for SAC+ML offlinetraining
 def _update_critic_sacml(
@@ -111,11 +69,12 @@ def _update_critic_sacml(
     min_target_v = jnp.min(target_vs, axis=0)
 
     # Compute Bellman Target
-    v_backup = batch["rewards"] + (1 - batch["terminations"]) * (gamma) * (min_target_v + actor_state.apply_fn(batch["next_observations"], next_actions, method=TanhGaussianPolicy.log_probs))
+    target_log_probs = actor_state.apply_fn(actor_state.params, batch["next_observations"], next_actions, method=TanhGaussianPolicy.log_probs) 
+    v_backup = batch["rewards"] + (1 - batch["terminations"]) * (gamma) * (min_target_v + target_log_probs - alpha*target_log_probs)
 
     # Calculate Critic Loss
     def v_critic_loss_fn(p):
-        current_vs = v_critic_state.apply_fn(p, batch["observations"])
+        current_vs = v_critic_state.apply_fn(p, batch["observations"]) + actor_state.apply_fn(actor_state.params, batch["observations"], batch["actions"], method=TanhGaussianPolicy.log_probs) 
         loss = jnp.mean(jnp.square(current_vs - v_backup[None, :]))
         return loss
     
@@ -149,9 +108,9 @@ def _update_actor_and_alpha_sacml(
             
             # Get Q estimation for the action in the batch
             q_mu_pi = critics_state.apply_fn(critics_state.params, states, actions)
-            q_mu = jnp.min(q_mu_pi)
+            q_mu = jnp.min(q_mu_pi, axis=0)
 
-            lambda_h = omega / jnp.mean(q_mu)
+            lambda_h = jax.lax.stop_gradient(omega / jnp.clip((jnp.mean(jnp.abs(q_mu)) + 1e-8), max=200))
             BC_loss = jnp.mean(actor_state.apply_fn(p, states, actions, method=TanhGaussianPolicy.log_probs))
             
             # Actor loss: alpha * log_pi - Q
@@ -165,7 +124,7 @@ def _update_actor_and_alpha_sacml(
         # Update Alpha
         def alpha_loss_fn(p):
             cur_log_alpha = alpha_state.apply_fn(p)
-            return -jnp.mean(jnp.exp(cur_log_alpha) * (jax.lax.stop_gradient(log_probs_for_alpha) + target_entropy))
+            return -(jnp.exp(cur_log_alpha) * jnp.mean(jax.lax.stop_gradient(log_probs_for_alpha + target_entropy)))
             
         alpha_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(alpha_state.params)
         new_alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
@@ -268,7 +227,7 @@ class ACA_Agent:
             action_dim,
             tau=0.005,
             gamma=0.99,
-            alpha=0.2,
+            alpha_init=1.0,
             lr=3e-4,
             batch_size=256,
             buffer_size=1_000_000,
@@ -278,7 +237,7 @@ class ACA_Agent:
             target_update_interval=1,
             policy_delay_update=1,
             target_entropy=None,
-            omega = 30.0,
+            omega = 100.0,
             kappa = 1.0,
             beta = 15.0,
             seed=0,
@@ -301,6 +260,7 @@ class ACA_Agent:
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         self.n_steps = n_steps
+        self.alpha_init = alpha_init
         assert n_steps == 1, "Support for n_step != 1 is not available!!!"
         self.train_freq = train_freq
         self.gradient_steps = gradient_steps
@@ -382,11 +342,11 @@ class ACA_Agent:
 
         # 3. Alpha (Temperature)
         if target_entropy is None:
-            self.target_entropy = -float(action_dim)/2
+            self.target_entropy = -float(action_dim)
         else:
             self.target_entropy = target_entropy
             
-        self.alpha_def = AlphaModule(target_entropy=self.target_entropy)
+        self.alpha_def = AlphaModule(ent_init=self.alpha_init)
         alpha_params = self.alpha_def.init(alpha_offline_key)
         self.alpha_state = TrainState.create(
             apply_fn=self.alpha_def.apply,
@@ -396,8 +356,7 @@ class ACA_Agent:
 
         # Replay Buffers
         self.replay_buffer = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.gradient_steps), gamma, n_envs)
-        self.replay_buffer_demo = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.gradient_steps*self.per_batch_demo), gamma, 1)
-
+        self.replay_buffer_demo = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.gradient_steps), gamma, 1)
         # Hparams for logging
         self.hparams = {
             "state_dim": self.state_dim, "action_dim": self.action_dim, "tau": self.tau,
@@ -533,7 +492,7 @@ class ACA_Agent:
                         omega=omega,
                     )
                 )
-                return new_actor, new_alpha, new_a_loss, new_al_loss, new_curr_alpha, rng_inner
+                return new_actor, new_alpha, new_a_loss, new_al_loss, jnp.squeeze(new_curr_alpha), rng_inner
 
             def skip_actor_update(_):
                 return actor_state, alpha_state, a_loss, al_loss, curr_alpha, rng
@@ -888,7 +847,7 @@ class ACA_Agent:
             if  pbar : pbar.update(self.gradient_steps)
             if callback: callback.on_step(self._count_total_gradients_taken,self)
 
-            if (self._count_total_gradients_taken+1) % log_interval_metric == 0:
+            if (self._count_total_gradients_taken) % log_interval_metric == 0:
                 self.logger.log_metric("offline/critic_loss", metrics["critic_loss"], step=self._count_total_gradients_taken)
                 self.logger.log_metric("offline/actor_loss", metrics["actor_loss"], step=self._count_total_gradients_taken)
                 self.logger.log_metric("offline/v_critic_loss", metrics["v_critic_loss"], step=self._count_total_gradients_taken)
@@ -898,11 +857,11 @@ class ACA_Agent:
                 if verbose:
                     tqdm.write("-"*50)
                     tqdm.write(f"Step: {self._count_total_gradients_taken:<8d}")
-                    tqdm.write(f" Critic Loss: {metrics["critic_loss"]:.2f}")
-                    tqdm.write(f" Actor Loss: {metrics["actor_loss"]:.2f}")
-                    tqdm.write(f" Value Critic Loss: {metrics["v_critic_loss"]:.2f}")
-                    tqdm.write(f" Alpha Loss: {metrics["alpha_loss"]:.2f}")
-                    tqdm.write(f" Alpha: {metrics["alpha"]:.2f}")
+                    tqdm.write(f" Critic Loss: {metrics['critic_loss']:.2f}")
+                    tqdm.write(f" Actor Loss: {metrics['actor_loss']:.2f}")
+                    tqdm.write(f" Value Critic Loss: {metrics['v_critic_loss']:.2f}")
+                    tqdm.write(f" Alpha Loss: {metrics['alpha_loss']:.2f}")
+                    tqdm.write(f" Alpha: {metrics['alpha']:.2f}")
                     tqdm.write("-"*50)
 
         if callback: callback.on_training_end(self)
