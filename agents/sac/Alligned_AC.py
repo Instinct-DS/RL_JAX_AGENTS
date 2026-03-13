@@ -15,7 +15,7 @@ from common.replaybuffer import ReplayBuffer
 from common.logger import MLFlowLogger
 from common.utils import load_demo_trajectories, load_demo_trajectories_parallel
 
-from networks.critic import Q_network, CombinedCritics, V_network, CombinedBaselines
+from networks.critic import Q_network, CombinedCritics, V_network, CombinedBaselines, init_critic_from_baseline
 from networks.actor import DeterministicPolicy, TanhGaussianPolicy
 from flax.training.train_state import TrainState
 
@@ -398,10 +398,6 @@ class ACA_Agent:
         self.replay_buffer = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.gradient_steps), gamma, n_envs)
         self.replay_buffer_demo = ReplayBuffer(state_dim, action_dim, buffer_size, int(batch_size*self.gradient_steps*self.per_batch_demo), gamma, 1)
 
-        # Logger
-        if logger_name == "mlflow":
-            self.logger = MLFlowLogger(uri=mlflow_uri, experiment_name=experiment_name, run_name=run_name)
-            
         # Hparams for logging
         self.hparams = {
             "state_dim": self.state_dim, "action_dim": self.action_dim, "tau": self.tau,
@@ -409,6 +405,12 @@ class ACA_Agent:
             "n_critics": n_critics, "m_critics": m_critics, "seed": seed,
             "beta" : beta, "omega" : omega, "kappa" : kappa
         }
+
+        # Logger
+        if logger_name == "mlflow":
+            self.logger = MLFlowLogger(uri=mlflow_uri, experiment_name=experiment_name, run_name=run_name)
+            self.logger.start()
+            self.logger.log_params(self.hparams)
 
     @staticmethod
     @partial(jax.jit, static_argnames="apply_fn")
@@ -692,3 +694,216 @@ class ACA_Agent:
             actor_state, critics_state, target_critics_params, alpha_state, metrics
         )
     
+    def actor_critic_allignment(self):
+        # Transfering the actor
+        self.actor_online_state = self.actor_online_state.replace(params=self.actor_offline_state.params)
+        # Transfering the critic
+        self.rng, critic_key = jax.random.split(self.rng)
+        new_critics_params = init_critic_from_baseline(
+            baseline_params=self.v_critics_state.params,
+            critic_params=self.critics_state.params,
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            noise_scale=1e-4,
+            rng=critic_key
+        )
+        new_critic_opt = self.critics_state.tx.init(new_critics_params)
+        self.critics_state = self.critics_state.replace(
+            params=new_critics_params,
+            opt_state=new_critic_opt,
+            step=0
+        )
+
+        self.rng, critic_key2 = jax.random.split(self.rng)
+        new_target_critic_params = init_critic_from_baseline(
+            baseline_params=self.v_target_critics_params,
+            critic_params=self.target_critics_params,
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            noise_scale=1e-4,
+            rng=critic_key2
+        )
+        self.target_critics_params = new_target_critic_params
+        # Transfering the alpha
+        self.rng, alpha_key = jax.random.split(self.rng)
+        self.alpha_def = AlphaModule(target_entropy=self.target_entropy)
+        alpha_params = self.alpha_def.init(alpha_key)
+        self.alpha_state = TrainState.create(
+            apply_fn=self.alpha_def.apply,
+            params=alpha_params,
+            tx=optax.adam(self.lr)
+        )
+
+
+    def online_train(
+            self, 
+            env,
+            total_online_training_steps=1_000_000,
+            learning_starts=5_000,
+            progress_bar = True,
+            verbose = 1,
+            log_interval = 5,
+            log_interval_metric = 5_000,
+            callback = None
+    ):
+        self.total_online_training_steps = total_online_training_steps
+        self._count_total_gradients_taken = 0
+        if callback: callback.on_training_start(self)
+        pbar = tqdm(total=total_online_training_steps) if progress_bar else None
+
+        obs, _ = env.reset()
+        _episode_start = np.zeros(env.num_envs, dtype=bool)
+        _episode_rewards = np.zeros(env.num_envs)
+        _episode_lengths = np.zeros(env.num_envs)
+        
+        self._total_timesteps_ran = 0
+        self.logger_count = 1
+
+        while self._total_timesteps_ran <= self.total_online_training_steps:
+            # Action Selection
+            self.rng, key = jax.random.split(self.rng)
+            actions = self.select_action(obs, deterministic=False)
+
+            next_obs, rewards, terminations, truncations, infos = env.step(actions)
+            dones = np.logical_or(terminations, truncations)
+
+            for i in range(env.num_envs):
+                if not _episode_start[i]:
+                    self.replay_buffer.add(obs[i], actions[i], rewards[i], terminations[i], truncations[i], next_obs[i])
+                else:
+                    self.logger_count += 1
+                    self._ep_lengths.append(_episode_lengths[i])
+                    self._ep_rewards.append(_episode_rewards[i])
+                    _episode_rewards[i], _episode_lengths[i] = 0, -1
+
+            _episode_rewards += rewards
+            _episode_lengths += 1
+            self._total_timesteps_ran += env.num_envs
+            obs = next_obs
+            _episode_start = dones
+
+            # Update Step
+            if self._total_timesteps_ran >= learning_starts and self._total_timesteps_ran % self.train_freq == 0:
+                    # Sample Buffers
+                    batch = self.replay_buffer.sample()
+
+                    # Update
+                    self.rng, update_key = jax.random.split(self.rng)
+                             
+                    (self.actor_online_state, self.critics_state, self.target_critics_params, 
+                    self.alpha_state, metrics) = ACA_Agent.batch_update_online(
+                        self.actor_offline_state,
+                        self.critics_state,
+                        self.target_critics_params,
+                        self.alpha_state,
+                        self.actor_offline_state,
+                        batch,
+                        self.beta,
+                        self.kappa,
+                        update_key,
+                        self.gamma,
+                        self.tau,
+                        self.target_entropy,
+                        self.gradient_steps,
+                        self.policy_delay_update
+                    )
+                    self._count_total_gradients_taken += self.gradient_steps        
+
+            # Logging
+            if self._total_timesteps_ran >= learning_starts and self.logger_count % log_interval == 0:
+                mean_rew = np.mean(self._ep_rewards) if self._ep_rewards else 0
+                mean_len = np.mean(self._ep_lengths) if self._ep_lengths else 0
+                fps = self._total_timesteps_ran / (time() - self._start_time)
+
+                self.logger.log_metric("rollout/mean_episode_length", mean_len, step=self._total_timesteps_ran)
+                self.logger.log_metric("rollout/mean_episode_reward", mean_rew, step=self._total_timesteps_ran)
+                self.logger.log_metric("rollout/frames_per_second", fps, step=self._total_timesteps_ran)
+                
+                if verbose:
+                    tqdm.write("-"*50)
+                    tqdm.write(f" Step: {self._total_timesteps_ran:<8d}")
+                    tqdm.write(f" MeanEpLen: {mean_len:.2f}")
+                    tqdm.write(f" MeanEpRew: {mean_rew:.2f}")
+                    tqdm.write("-"*50)
+                
+                self.logger_count = 1
+
+            if self._total_timesteps_ran >= learning_starts and self._count_total_gradients_taken % log_interval_metric == 0:
+                self.logger.log_metric("training/actor_loss", metrics['actor_loss'].item(), step=self._total_timesteps_ran)
+                self.logger.log_metric("training/critic_loss", metrics['critic_loss'].item(), step=self._total_timesteps_ran)
+                self.logger.log_metric("training/alpha_loss", metrics['alpha_loss'].item(), step=self._total_timesteps_ran)
+                self.logger.log_metric("training/alpha", metrics['alpha'].item(), step=self._total_timesteps_ran)
+
+                if verbose:
+                    tqdm.write("-"*50)
+                    tqdm.write(f" Actor_Loss: {metrics['actor_loss'].item():<2f}")
+                    tqdm.write(f" Critic_Loss: {metrics['critic_loss'].item():.2f}")
+                    tqdm.write(f" Alpha_Loss: {metrics['alpha_loss'].item():.2f}")
+                    tqdm.write(f" Alpha: {metrics['alpha'].item():.2f}")
+                    tqdm.write("-"*50)
+
+            if callback: callback.on_step(self._total_timesteps_ran,self)
+            if pbar: pbar.update(env.num_envs)
+
+        if callback: callback.on_training_end(self)
+        return self.actor_online_state 
+
+    def offline_train(
+            self, 
+            total_offline_training_steps=5_00_000,
+            progress_bar = True,
+            verbose = 1,
+            log_interval = 5,
+            log_interval_metric = 5_000,
+            callback = None
+    ):
+        self.total_offline_training_steps = total_offline_training_steps
+        self._count_total_gradients_taken = 0
+        if callback: callback.on_training_start(self)
+        pbar = tqdm(total=total_offline_training_steps) if progress_bar else None
+
+        while self._count_total_gradients_taken <= self.total_offline_training_steps:
+            batch_demo = self.replay_buffer_demo.sample()
+            # Update key
+            self.rng, update_key = jax.random.split(self.rng)
+            (self.actor_offline_state, self.critics_state, self.target_critics_params, 
+             self.alpha_state, self.v_critics_state, self.v_target_critics_params, metrics) = ACA_Agent.batch_update_offline(
+                 self.actor_offline_state,
+                 self.critics_state,
+                 self.target_critics_params,
+                 self.alpha_state,
+                 self.v_critics_state,
+                 self.v_target_critics_params,
+                 batch_demo,
+                 self.omega,
+                 update_key,
+                 self.gamma,
+                 self.tau,
+                 self.target_entropy,
+                 self.gradient_steps,
+                 self.policy_delay_update
+             )
+            
+            self._count_total_gradients_taken += self.gradient_steps
+            if  pbar : pbar.update(self.gradient_steps)
+            if callback: callback.on_step(self._count_total_gradients_taken,self)
+
+            if (self._count_total_gradients_taken+1) % log_interval_metric == 0:
+                self.logger.log_metric("offline/critic_loss", metrics["critic_loss"], step=self._count_total_gradients_taken)
+                self.logger.log_metric("offline/actor_loss", metrics["actor_loss"], step=self._count_total_gradients_taken)
+                self.logger.log_metric("offline/v_critic_loss", metrics["v_critic_loss"], step=self._count_total_gradients_taken)
+                self.logger.log_metric("offline/alpha_loss", metrics["alpha_loss"], step=self._count_total_gradients_taken)
+                self.logger.log_metric("offline/alpha", metrics["alpha"], step=self._count_total_gradients_taken)
+
+                if verbose:
+                    tqdm.write("-"*50)
+                    tqdm.write(f"Step: {self._count_total_gradients_taken:<8d}")
+                    tqdm.write(f" Critic Loss: {metrics["critic_loss"]:.2f}")
+                    tqdm.write(f" Actor Loss: {metrics["actor_loss"]:.2f}")
+                    tqdm.write(f" Value Critic Loss: {metrics["v_critic_loss"]:.2f}")
+                    tqdm.write(f" Alpha Loss: {metrics["alpha_loss"]:.2f}")
+                    tqdm.write(f" Alpha: {metrics["alpha"]:.2f}")
+                    tqdm.write("-"*50)
+
+        if callback: callback.on_training_end(self)
+        if pbar: pbar.close()  
